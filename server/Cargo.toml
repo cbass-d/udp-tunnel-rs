@@ -1,0 +1,12 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc2 = { version = "3.7.3", features = ["async"] }
+futures = "0.3.31"
+pnet_packet = "0.35.0"
+tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
+tokio-util = "0.7.16"
+tun = { version = "0.8.4", features = ["async"] }
