@@ -3,6 +3,7 @@ use clap::Parser;
 use clap_derive::Parser;
 use cli_log::*;
 use client::perform_server_handshake;
+use common::messages::*;
 use futures::{SinkExt, StreamExt};
 use pnet_packet::{
     Packet,
@@ -102,14 +103,23 @@ async fn start(token: CancellationToken) -> Result<(), BoxError> {
                 println!("[-] Quitting");
                 break;
             },
-            _ = interval.tick() => {
-            },
+            _ = interval.tick() => {},
             result = socket.recv_from(&mut sock_buf) => {
                 let (len, peer) = result?;
                 println!("[*] Recv {len} from {peer}");
+                if let Ok(keep_alive) = serde_json::from_slice::<KeepAliveMessage>(&sock_buf[..len]) {
+                    if keep_alive.msg_type == KeepAliveType::Request {
+                        let keep_alive = {
+                            let msg = KeepAliveMessage {msg_type: KeepAliveType::Reply };
+                            serde_json::to_vec(&msg).unwrap()
+                        };
+                        socket.send(&keep_alive[..]).await?;
+                    }
+
+                    continue;
+                }
 
                 let ipv4_packet = ipv4::Ipv4Packet::new(&sock_buf[..len]).unwrap();
-
                 framed_dev.send(ipv4_packet.packet().to_vec()).await?;
             },
             Some(packet) = framed_dev.next() => {

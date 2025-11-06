@@ -10,3 +10,14 @@ impl fmt::Display for UnexpectedSource {
         write!(f, "Unexpected source in message received")
     }
 }
+
+#[derive(Debug)]
+pub struct UnexpectedMessage;
+
+impl Error for UnexpectedMessage {}
+
+impl fmt::Display for UnexpectedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Unexpected message received")
+    }
+}

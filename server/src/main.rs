@@ -1,8 +1,12 @@
 use futures::{SinkExt, StreamExt};
-use server::perform_client_handshake;
+use server::{
+    ClientConnection, add_client, keep_alive, perform_client_handshake, remove_connection,
+};
+use std::sync::Arc;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -15,7 +19,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tun::{self, AbstractDevice, BoxError, Configuration};
 
-use common::ClientHelloMessage;
+use common::messages::*;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -42,18 +46,22 @@ async fn main() -> Result<(), BoxError> {
     })?;
 
     println!("[*] Starting server...");
-    start(token).await?;
+    let args = Args::parse();
+    let tun_name = args.tun_name;
+    let address = args.address;
+    let port = args.port;
+    start(token, tun_name, address, port).await?;
     ctrlc.await?;
     Ok(())
 }
 
 // Main function for starting the server
-async fn start(token: CancellationToken) -> Result<(), BoxError> {
-    let args = Args::parse();
-    let tun_name = args.tun_name;
-    let address = args.address;
-    let port = args.port;
-
+async fn start(
+    token: CancellationToken,
+    tun_name: Option<String>,
+    address: Ipv4Addr,
+    port: u16,
+) -> Result<(), BoxError> {
     let bind_adress = format!("0.0.0.0:{port}");
     let socket = UdpSocket::bind(bind_adress).await?;
     println!(
@@ -80,10 +88,13 @@ async fn start(token: CancellationToken) -> Result<(), BoxError> {
     let mut sock_buf = [0; 2048];
 
     // Stuff for client connections
-    let mut known_conns: HashMap<SocketAddr, Ipv4Addr> = HashMap::new();
+    let mut known_conns: HashMap<SocketAddr, ClientConnection> = HashMap::new();
     let mut ip_to_sock: HashMap<Ipv4Addr, SocketAddr> = HashMap::new();
+    let mut dead_connections: HashSet<(SocketAddr, Ipv4Addr)> = HashSet::new();
     let mut address_pool =
         ipnet::Ipv4AddrRange::new("10.0.0.2".parse().unwrap(), "10.0.0.10".parse().unwrap());
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     // Main event loop
     loop {
@@ -101,8 +112,13 @@ async fn start(token: CancellationToken) -> Result<(), BoxError> {
                         match perform_client_handshake(&socket, &mut address_pool, &peer, client_hello).await {
                                 Ok(client_addr) => {
                                     println!("[+] Handshake with client successful");
-                                    println!("[+] Adding new peer {peer} to hashset");
-                                    known_conns.insert(peer, client_addr);
+                                    println!("[+] Adding new peer {peer} to hashset with IP {client_addr}");
+                                    let client_connection = ClientConnection {
+                                        sock_addr: peer,
+                                        assigned_ip: client_addr,
+                                        last_seen: Instant::now(),
+                                    };
+                                    known_conns.insert(peer, client_connection);
                                     ip_to_sock.insert(client_addr, peer);
                                 },
                                 Err(e) => println!("[-] Client handshake error: {e}"),
@@ -111,10 +127,12 @@ async fn start(token: CancellationToken) -> Result<(), BoxError> {
                 }
                 else {
                     let raw_packet = &sock_buf[..len];
+
+                    let client = known_conns.get_mut(&peer).unwrap();
+                    client.update_last_seen(Instant::now());
                     match raw_packet[0] >> 4 {
                         4 => {
                             let ipv4_packet = ipv4::Ipv4Packet::new(&raw_packet[..]).unwrap();
-
                             let des = ipv4_packet.get_destination();
 
                             if !ip_to_sock.contains_key(&des) {
@@ -143,6 +161,24 @@ async fn start(token: CancellationToken) -> Result<(), BoxError> {
                         let _len = socket.send_to(ipv4_packet.packet(), peer).await?;
                     }
                 }
+            },
+            _ = interval.tick() => {
+                for (peer, client) in known_conns.iter() {
+                    match keep_alive(&socket, peer).await {
+                        Ok(()) => {},
+                        Err(_) => {
+                            println!("[-] Keep alive for {peer} ({}) failed", client.assigned_ip);
+                            dead_connections.insert((*peer, client.assigned_ip));
+                        },
+                    }
+                }
+
+                for (peer, client_ip) in dead_connections.iter() {
+                    println!("[-] Removing {peer} from connections");
+                    let _ = known_conns.remove_entry(&peer);
+                    ip_to_sock.remove_entry(&client_ip);
+                }
+                dead_connections.clear();
             },
         }
     }
