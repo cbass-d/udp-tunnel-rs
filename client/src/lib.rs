@@ -1,7 +1,11 @@
 use anyhow::Result;
 use common::{errors::*, messages::*};
-use std::net::{Ipv4Addr, SocketAddr};
-use tokio::net::UdpSocket;
+use std::{
+    io,
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+use tokio::{net::UdpSocket, time::timeout};
 
 pub async fn perform_server_handshake(socket: &UdpSocket, server: SocketAddr) -> Result<Ipv4Addr> {
     println!("[*] Connecting to server...");
@@ -18,16 +22,20 @@ pub async fn perform_server_handshake(socket: &UdpSocket, server: SocketAddr) ->
     let mut sock_buf = [0; 1024];
 
     println!("[*] Waiting for server_hello...");
-    let (len, peer) = socket.recv_from(&mut sock_buf[..]).await?;
+    if let Ok((len, peer)) =
+        timeout(Duration::from_secs(5), socket.recv_from(&mut sock_buf[..])).await?
+    {
+        if peer != server {
+            println!("[-] Unexpected source address of message");
+            return Err(UnexpectedSource.into());
+        }
 
-    if peer != server {
-        println!("[-] Unexpected source address of message");
-        return Err(UnexpectedSource.into());
+        let server_hello = serde_json::from_slice::<ServerHelloMessage>(&sock_buf[..len]).unwrap();
+        let assigned_addr = server_hello.assigned_ip;
+        println!("[*] Recived server_hello with assigned ip: {assigned_addr}");
+
+        Ok(assigned_addr)
+    } else {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout received").into());
     }
-
-    let server_hello = serde_json::from_slice::<ServerHelloMessage>(&sock_buf[..len]).unwrap();
-    let assigned_addr = server_hello.assigned_ip;
-    println!("[*] Recived server_hello with assigned ip: {assigned_addr}");
-
-    Ok(assigned_addr)
 }

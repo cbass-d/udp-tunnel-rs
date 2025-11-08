@@ -1,99 +1,121 @@
 pub mod errors;
+pub mod handshake;
+pub mod keep_alive;
+pub mod manager;
+pub mod registry;
+pub mod socket;
+pub mod tun;
+
+pub use common::{errors::*, messages::*};
 
 use anyhow::Result;
-use common::messages::KeepAliveType;
-use common::{errors::*, messages::*};
-use ipnet::Ipv4AddrRange;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{net::UdpSocket, sync::mpsc};
+use tokio_util::sync::CancellationToken;
 
-#[derive(Debug)]
-pub struct ClientConnection {
-    pub assigned_ip: Ipv4Addr,
-    pub sock_addr: SocketAddr,
-    pub last_seen: Instant,
-}
+use crate::{
+    manager::ManagerMessages, registry::ClientRegistry, socket::SocketMessage, tun::TunMessage,
+};
 
-impl ClientConnection {
-    pub fn update_last_seen(&mut self, instant: Instant) {
-        self.last_seen = instant;
-    }
-}
-
-pub async fn perform_client_handshake(
-    socket: &UdpSocket,
-    address_pool: &mut Ipv4AddrRange,
-    peer: &SocketAddr,
-    _client_hello: ClientHelloMessage,
-) -> Result<Ipv4Addr> {
-    if let Some(assigned_ip) = address_pool.next() {
-        let server_hello = {
-            let hello = ServerHelloMessage { assigned_ip };
-            serde_json::to_vec(&hello).unwrap()
-        };
-
-        let len = socket.send_to(&server_hello[..], peer).await?;
-        println!("[+] Wrote {len} bytes of sever_hello to {peer}");
-        return Ok(assigned_ip);
-    }
-
-    Err(errors::NoAddressLeft.into())
-}
-
-pub fn add_client(
-    known_conns: &mut HashMap<SocketAddr, Ipv4Addr>,
-    ip_to_sock: &mut HashMap<Ipv4Addr, SocketAddr>,
-    peer: SocketAddr,
-    assigned_ip: Ipv4Addr,
+pub async fn start(
+    token: CancellationToken,
+    tun_name: Option<String>,
+    address: Ipv4Addr,
+    port: u16,
 ) -> Result<()> {
-    println!("[+] Adding new peer {peer} to hashset with IP {assigned_ip}");
-    known_conns.insert(peer, assigned_ip);
-    ip_to_sock.insert(assigned_ip, peer);
+    let bind_adress = format!("0.0.0.0:{port}");
+    let socket = UdpSocket::bind(bind_adress).await?;
+    println!(
+        "[*] Binded to UDP Socket at {}",
+        socket.local_addr().unwrap()
+    );
+
+    let tun_device = tun::create_tun(tun_name, address)?;
+
+    let (tun_tx, tun_rx) = mpsc::unbounded_channel::<TunMessage>();
+    let (socket_tx, socket_rx) = mpsc::unbounded_channel::<SocketMessage>();
+    let framed_device = tun_device.into_framed();
+
+    let mut sock_buf = [0; 2048];
+
+    let client_registry: Arc<ClientRegistry> = Arc::new(ClientRegistry::new());
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    let (manager_tx, manager_rx) = mpsc::unbounded_channel::<ManagerMessages>();
+
+    let manager_task = tokio::task::spawn(manager::run(manager_rx, token.clone()));
+
+    let tun_socket_task = tokio::task::spawn(tun::run(
+        framed_device,
+        manager_tx.clone(),
+        socket_tx.clone(),
+        tun_rx,
+        token.clone(),
+    ));
+
+    let udp_socket_task = tokio::task::spawn(socket::run(
+        socket,
+        manager_tx.clone(),
+        tun_tx.clone(),
+        socket_rx,
+        token.clone(),
+    ));
+
+    token.cancelled().await;
+
+    // Main event loop
+    //loop {
+    //    tokio::select! {
+    //        _ = token.cancelled() => {
+    //            println!("[*] Quitting");
+    //            break;
+    //        },
+    //        result = socket.recv_from(&mut sock_buf) => {
+    //            else {
+    //                let raw_packet = &sock_buf[..len];
+
+    //                let client = known_conns.get_mut(&peer).unwrap();
+    //                client.update_last_seen(Instant::now());
+    //                match raw_packet[0] >> 4 {
+    //                    4 => {
+    //                        let ipv4_packet = ipv4::Ipv4Packet::new(&raw_packet[..]).unwrap();
+    //                        let des = ipv4_packet.get_destination();
+
+    //                        if !ip_to_sock.contains_key(&des) {
+    //                            framed_tun.send(ipv4_packet.packet().to_vec()).await?;
+    //                            continue;
+    //                        }
+
+    //                        let peer = ip_to_sock[&des];
+    //                        let _len = socket.send_to(ipv4_packet.packet(), peer).await?;
+    //                    },
+    //                    6 => {
+    //                    },
+    //                    _ => {},
+    //                }
+    //            }
+
+    //        },
+    //        Some(packet) = framed_tun.next() => {
+    //            if let Ok(packet) = packet {
+    //                let ipv4_packet = ipv4::Ipv4Packet::new(&packet[..]).unwrap();
+
+    //                let dst = ipv4_packet.get_destination();
+
+    //                if ip_to_sock.contains_key(&dst) {
+    //                    let peer = ip_to_sock[&dst];
+    //                    let _len = socket.send_to(ipv4_packet.packet(), peer).await?;
+    //                }
+    //            }
+    //        },
+    //    }
+    //}
+
     Ok(())
-}
-
-pub async fn keep_alive(socket: &UdpSocket, peer: &SocketAddr) -> Result<()> {
-    let keep_alive = {
-        let msg = KeepAliveMessage {
-            msg_type: KeepAliveType::Request,
-        };
-        serde_json::to_vec(&msg).unwrap()
-    };
-
-    match socket.send_to(&keep_alive[..], peer).await {
-        Ok(_) => {
-            let mut buf = [0; 1024];
-            if let Ok((len, reply_peer)) =
-                timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await?
-            {
-                if *peer != reply_peer {
-                    return Err(UnexpectedSource.into());
-                }
-
-                let msg = serde_json::from_slice::<KeepAliveMessage>(&buf[..len])?;
-
-                if msg.msg_type != KeepAliveType::Reply {
-                    return Err(UnexpectedMessage.into());
-                }
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
-
-    Ok(())
-}
-
-pub fn remove_connection(
-    known_conns: &mut HashMap<SocketAddr, Ipv4Addr>,
-    ip_to_sock: &mut HashMap<Ipv4Addr, SocketAddr>,
-    peer: &SocketAddr,
-    client_ip: &Ipv4Addr,
-) {
-    println!("[-] Removing {peer} from connections");
-    let _ = known_conns.remove_entry(&peer);
-    ip_to_sock.remove_entry(&client_ip);
 }
