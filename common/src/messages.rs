@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum KeepAliveType {
@@ -18,4 +18,13 @@ pub struct ServerHelloMessage {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KeepAliveMessage {
     pub msg_type: KeepAliveType,
+}
+
+pub enum TunMessages {
+    WritePacket(Vec<u8>),
+}
+
+pub enum SocketMessages {
+    WritePacket(SocketAddr, Vec<u8>),
+    WritePacketToServer(Vec<u8>),
 }

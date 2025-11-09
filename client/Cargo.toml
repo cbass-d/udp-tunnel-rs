@@ -7,7 +7,7 @@ edition = "2024"
 ctrlc2 = { version = "3.7.3", features = ["async"] }
 futures = "0.3.31"
 pnet = "0.35.0"
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "time"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7.16"
 tun = { version = "0.8.4", features = ["async"] }
 common = {path = "../common"}

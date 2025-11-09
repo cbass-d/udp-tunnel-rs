@@ -14,7 +14,7 @@ use std::net::Ipv4Addr;
 use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::{manager::ManagerMessages, socket::SocketMessage, tun::TunMessage};
+use crate::manager::ManagerMessages;
 
 pub async fn start(
     token: CancellationToken,
@@ -29,15 +29,14 @@ pub async fn start(
         socket.local_addr().unwrap()
     );
 
-    let tun_device = tun::create_tun(tun_name, address)?;
-    let framed_device = tun_device.into_framed();
+    let framed_tun = tun::create_tun(tun_name, address)?;
 
     // Channels for message/packet passing:
     // * messages for manager (adding and removing clients, and other stuff
     // * passing packets between the tun interface and the UDP socket facing the clients
     let (manager_tx, manager_rx) = mpsc::unbounded_channel::<ManagerMessages>();
-    let (tun_tx, tun_rx) = mpsc::unbounded_channel::<TunMessage>();
-    let (socket_tx, socket_rx) = mpsc::unbounded_channel::<SocketMessage>();
+    let (tun_tx, tun_rx) = mpsc::unbounded_channel::<TunMessages>();
+    let (socket_tx, socket_rx) = mpsc::unbounded_channel::<SocketMessages>();
 
     // Spawn each of the task in a task set, for easier management of joining,
     // aborting, logging, etc.
@@ -46,7 +45,7 @@ pub async fn start(
     let _manager_task = task_set.spawn(manager::run(manager_rx, token.clone()));
 
     let _tun_task = task_set.spawn(tun::run(
-        framed_device,
+        framed_tun,
         manager_tx.clone(),
         socket_tx.clone(),
         tun_rx,

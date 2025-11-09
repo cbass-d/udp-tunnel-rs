@@ -3,26 +3,20 @@ use pnet_packet::{Packet, ipv4};
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Result;
-use common::messages::ClientHelloMessage;
+use common::messages::{ClientHelloMessage, SocketMessages, TunMessages};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    handshake, keep_alive, manager::ManagerMessages, registry::ClientConnection, tun::TunMessage,
-};
-
-pub enum SocketMessage {
-    WritePacket(SocketAddr, Vec<u8>),
-}
+use crate::{handshake, keep_alive, manager::ManagerMessages, registry::ClientConnection};
 
 pub async fn run(
     socket: UdpSocket,
     manager_tx: mpsc::UnboundedSender<ManagerMessages>,
-    tun_tx: mpsc::UnboundedSender<TunMessage>,
-    mut socket_rx: mpsc::UnboundedReceiver<SocketMessage>,
+    tun_tx: mpsc::UnboundedSender<TunMessages>,
+    mut socket_rx: mpsc::UnboundedReceiver<SocketMessages>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     // Task responsible for UDP socket:
@@ -69,7 +63,7 @@ pub async fn run(
                                 }
                                 else {
                                     info!("packet with no route found");
-                                    let write_packet = TunMessage::WritePacket(ipv4_packet.packet().to_vec());
+                                    let write_packet = TunMessages::WritePacket(ipv4_packet.packet().to_vec());
                                     tun_tx.send(write_packet)?;
                                 }
 
@@ -100,9 +94,10 @@ pub async fn run(
          },
          Some(message) = socket_rx.recv() => {
              match message {
-                    SocketMessage::WritePacket(peer, packet) => {
+                    SocketMessages::WritePacket(peer, packet) => {
                         let _ = socket.send_to(&packet[..], peer).await?;
                     },
+                    _ => {},
                 }
             },
             _ = interval.tick() => {

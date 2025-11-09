@@ -1,40 +1,40 @@
 use anyhow::Result;
+use common::messages::{SocketMessages, TunMessages};
 use futures::{SinkExt, StreamExt};
 use pnet_packet::{Packet, ipv4};
-use std::net::{Ipv4Addr, SocketAddr};
-use tokio::sync::{mpsc, oneshot};
+use std::net::Ipv4Addr;
+use tokio::sync::mpsc;
 use tokio_util::{codec::Framed, sync::CancellationToken};
 use tun::{AbstractDevice, AsyncDevice, Configuration, TunPacketCodec};
 
 use crate::manager::ManagerMessages;
-use common::messages::{SocketMessages, TunMessages};
 
 pub fn create_tun(
     tun_name: Option<String>,
-    address: Ipv4Addr,
+    assigned_addr: Ipv4Addr,
 ) -> Result<Framed<AsyncDevice, TunPacketCodec>> {
     let mut config = Configuration::default();
     config
         .tun_name(tun_name.unwrap_or("".to_string()))
-        .up()
-        .address(address)
-        .netmask((255, 255, 255, 0));
+        .address(assigned_addr)
+        .netmask((255, 255, 255, 0))
+        .up();
 
-    let tun = tun::create_as_async(&config).unwrap();
+    let dev = tun::create_as_async(&config).unwrap();
+
     println!(
-        "[+] Creating tun device with name : {}, and address: {}",
-        tun.tun_name().unwrap(),
-        tun.address().unwrap()
+        "[+] Configured new tun device with name: {} and address: {}",
+        dev.tun_name().unwrap(),
+        dev.address().unwrap()
     );
 
-    let framed_dev = tun.into_framed();
-
+    let framed_dev = dev.into_framed();
     Ok(framed_dev)
 }
 
 pub async fn run(
     mut framed_tun: Framed<AsyncDevice, TunPacketCodec>,
-    manager_tx: mpsc::UnboundedSender<ManagerMessages>,
+    _manager_tx: mpsc::UnboundedSender<ManagerMessages>,
     socket_tx: mpsc::UnboundedSender<SocketMessages>,
     mut tun_rx: mpsc::UnboundedReceiver<TunMessages>,
     cancel_token: CancellationToken,
@@ -49,17 +49,8 @@ pub async fn run(
                 if let Ok(packet) = packet {
                     let ipv4_packet = ipv4::Ipv4Packet::new(&packet[..]).unwrap();
 
-                    let dest = ipv4_packet.get_destination();
-
-                    let (tx, rx) = oneshot::channel::<Option<SocketAddr>>();
-                    let get_route = ManagerMessages::ResolveRoute(dest, tx);
-                    manager_tx.send(get_route)?;
-
-                    if let Some(route) = rx.await? {
-                        println!("sending packet to {dest}/{route}");
-                        let write_packet = SocketMessages::WritePacket(route, ipv4_packet.packet().to_vec());
-                        socket_tx.send(write_packet)?;
-                    }
+                    let write_packet = SocketMessages::WritePacketToServer(ipv4_packet.packet().to_vec());
+                    socket_tx.send(write_packet)?;
                 }
 
             },
