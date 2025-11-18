@@ -1,4 +1,0 @@
-20:31:33.242 [INFO] cli_log::init: Starting client v0.1.0 with log level DEBUG
-20:31:33.243 [INFO] client: [*] Connected to server at: localhost:9001
-20:31:34.216 [DEBUG] ctrlc2::platform::unix: Ctrl-C event received, writing to pipe
-20:31:34.216 [DEBUG] ctrlc2::r#async: AsyncCtrlC: waker was not set, cannot wake up
