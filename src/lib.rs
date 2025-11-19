@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
-use boringtun::noise::{Packet, Tunn, TunnResult};
+use anyhow::Result;
+use boringtun::noise::{Packet, Tunn, TunnResult, errors::WireGuardError};
 pub use boringtun::x25519;
 use log::{error, info, warn};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, io, net::SocketAddr, time::Duration};
 use tokio::{net::UdpSocket, time::timeout};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,15 +13,33 @@ pub enum HandshakeState {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum WgSocketError {
+pub enum WgTransportError {
     #[error("Timeout received")]
     Timeout,
     #[error("Socket not binded")]
     NotBinded,
     #[error("Socket not connected")]
     NotConnected,
-    #[error("Handshake not completed")]
+    #[error("Handshake has not been completed")]
     NoHandshake,
+    #[error("Failed to create Tunn structure")]
+    CreateTunnFailed,
+    #[error("{0}")]
+    Bind(io::Error),
+    #[error("{0}")]
+    Connect(io::Error),
+    #[error("{0}")]
+    Send(io::Error),
+    #[error("{0}")]
+    Recv(io::Error),
+    #[error("Invalid size: {0}, expected {1}")]
+    InvalidSize(usize, usize),
+    #[error("Unexpected Wireguard packet")]
+    UnexpectedPacket,
+    #[error("{0:?}")]
+    WgError(WireGuardError),
+    #[error("Unknown peer")]
+    UnknownPeer,
 }
 
 // WgSocket handles the underlying UDP socket as well as the
@@ -60,9 +78,11 @@ impl WgSocket {
         socketaddr: SocketAddr,
         peer_static_public: x25519::PublicKey,
         peer_socketaddr: SocketAddr,
-    ) -> Result<Self> {
-        let tunn = Tunn::new(static_private, peer_static_public, None, None, index, None)
-            .expect("failed to create Tunn");
+    ) -> Result<Self, WgTransportError> {
+        let tunn = match Tunn::new(static_private, peer_static_public, None, None, index, None) {
+            Ok(tunn) => tunn,
+            Err(_) => return Err(WgTransportError::CreateTunnFailed),
+        };
 
         Ok(Self {
             tunn,
@@ -76,28 +96,30 @@ impl WgSocket {
 
     // Binds the underlying UDP socket and makes is usable to connect to the peer endpoint
     // as well as updating the socket value to Some
-    pub async fn bind(&mut self) -> Result<()> {
+    pub async fn bind(&mut self) -> Result<(), WgTransportError> {
         if self.socket.is_none() {
-            let socket = UdpSocket::bind(self.socketaddr)
-                .await
-                .expect("failed to bind socket");
+            let socket = match UdpSocket::bind(self.socketaddr).await {
+                Ok(socket) => socket,
+                Err(e) => return Err(WgTransportError::Bind(e)),
+            };
 
             self.socket = Some(socket);
             info!("UDP socket binded to {}", self.socketaddr);
         } else {
             warn!("Attempted to rebind socket");
+            return Err(WgTransportError::Bind(io::ErrorKind::Other.into()));
         }
 
         Ok(())
     }
 
     // Connects the underlying UDP socket to the peer endpoint if binded, fails otherwise
-    pub async fn connect(&mut self) -> Result<()> {
+    pub async fn connect(&mut self) -> Result<(), WgTransportError> {
         if let Some(ref socket) = self.socket {
             socket
                 .connect(self.peer_socketaddr)
                 .await
-                .expect("failed to connect UDP socket");
+                .map_err(WgTransportError::Connect)?;
 
             info!(
                 "Connected to peer: {} -> {}",
@@ -105,7 +127,7 @@ impl WgSocket {
             );
         } else {
             error!("Connect failed: no binded socket");
-            return Err(WgSocketError::NotBinded.into());
+            return Err(WgTransportError::NotBinded);
         }
 
         self.connected = true;
@@ -114,58 +136,73 @@ impl WgSocket {
 
     // Initiate the Wireguard handshake with the specified peer endpoint using the
     // underlying Tunn structure and UDP socket. Fails if the UDP socket is not binded or connected
-    pub async fn initiate_handshake(&mut self) -> Result<()> {
+    pub async fn initiate_handshake(&mut self) -> Result<(), WgTransportError> {
         if !self.connected {
             error!("Handshake initiation failed: socket not connected");
-            return Err(WgSocketError::NotConnected.into());
+            return Err(WgTransportError::NotConnected);
         }
 
-        if self.socket.is_none() {
-            error!("Handshake initiation failed: no binded socket");
-            return Err(WgSocketError::NotBinded.into());
-        }
-        let socket = self.socket.as_ref().unwrap();
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Handshake initiation failed: no binded socket");
+                return Err(WgTransportError::NotBinded);
+            }
+        };
 
         info!("Initiating handshake");
         self.handshake = HandshakeState::Started;
 
         // Create and send handshake init
         let mut dst = vec![0u8; 2048];
-        let handshake_init = if let TunnResult::WriteToNetwork(data) =
-            self.tunn.format_handshake_initiation(&mut dst, false)
-        {
-            data
-        } else {
-            unreachable!();
+        let handshake_init = match self.tunn.format_handshake_initiation(&mut dst, false) {
+            TunnResult::WriteToNetwork(data) => data,
+            TunnResult::Err(e) => {
+                error!("Wireguard Tunn error");
+                return Err(WgTransportError::WgError(e));
+            }
+            _ => {
+                error!("Unexpected Wireguard packet");
+                return Err(WgTransportError::UnexpectedPacket);
+            }
         };
 
         socket
             .send(handshake_init)
             .await
-            .expect("UDP socket send failed");
+            .map_err(WgTransportError::Send)?;
+
         info!("Handhsake init message sent");
 
         // Recieve and parse response
         let mut buf = vec![0u8; 2048];
-        if let Ok(Ok(len)) = timeout(Duration::from_secs(10), socket.recv(&mut buf)).await {
+        if let Ok(recv_res) = timeout(Duration::from_secs(10), socket.recv(&mut buf)).await {
+            let len = recv_res.map_err(WgTransportError::Recv)?;
+
             info!("Handshake resp message received");
 
             let handshake_resp = self.tunn.decapsulate(None, &buf[..len], &mut dst);
             // Create and send keep alive
-            let keepalive = if let TunnResult::WriteToNetwork(data) = handshake_resp {
-                data
-            } else {
-                unreachable!();
+            let keepalive = match handshake_resp {
+                TunnResult::WriteToNetwork(data) => data,
+                TunnResult::Err(e) => {
+                    error!("Wireguard Tunn error");
+                    return Err(WgTransportError::WgError(e));
+                }
+                _ => {
+                    error!("Unexpected Wireguard packet");
+                    return Err(WgTransportError::UnexpectedPacket);
+                }
             };
 
             socket
                 .send(keepalive)
                 .await
-                .expect("UDP socket send failed");
+                .map_err(WgTransportError::Send)?;
 
             info!("Keepalive message sent");
         } else {
-            return Err(WgSocketError::Timeout.into());
+            return Err(WgTransportError::Timeout);
         }
 
         self.handshake = HandshakeState::Done;
@@ -174,50 +211,64 @@ impl WgSocket {
 
     // Respond to the Wireguard handshake initiation message.
     // Fails if the underlyint UDP socket is not binded or connected.
-    pub async fn handshake_response(&mut self) -> Result<()> {
+    pub async fn handshake_response(&mut self) -> Result<(), WgTransportError> {
         if !self.connected {
             error!("Handshake initiation failed: socket not connected");
-            return Err(WgSocketError::NotConnected.into());
+            return Err(WgTransportError::NotConnected);
         }
 
-        if self.socket.is_none() {
-            error!("Handshake response failed: no binded socket");
-            return Err(WgSocketError::NotBinded.into());
-        }
-        let socket = self.socket.as_ref().unwrap();
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Handshake initiation failed: no binded socket");
+                return Err(WgTransportError::NotBinded);
+            }
+        };
 
         self.handshake = HandshakeState::Started;
 
         // Receive and parse handshake initiation
         let mut buf = vec![0u8; 2048];
-        if let Ok(Ok(len)) = timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
-            info!("Handshake init message received");
+        if let Ok(recv_res) = timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
+            let len = recv_res.map_err(WgTransportError::Recv)?;
 
             let handshake_init = &buf[..len];
 
+            info!("Handshake init message received");
+
             // Create and send handshake response
             let mut dst = [0u8; 2048];
-            let handshake_resp = if let TunnResult::WriteToNetwork(data) =
-                self.tunn.decapsulate(None, handshake_init, &mut dst)
-            {
-                data
-            } else {
-                unreachable!();
+            let handshake_resp = match self.tunn.decapsulate(None, handshake_init, &mut dst) {
+                TunnResult::WriteToNetwork(data) => data,
+                TunnResult::Err(e) => {
+                    error!("Wireguard Tunn error");
+                    return Err(WgTransportError::WgError(e));
+                }
+                _ => {
+                    error!("Unexpected Wireguard packet");
+                    return Err(WgTransportError::UnexpectedPacket);
+                }
             };
 
             socket
                 .send(handshake_resp)
                 .await
-                .expect("UDP socket send failed");
+                .map_err(WgTransportError::Send)?;
 
             info!("Handshake message sent");
 
             // Recieve and parse keepalive
-            if let Ok(Ok(len)) = timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
-                info!("Keepalive message received");
+            if let Ok(recv_res) = timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
+                let len = recv_res.map_err(WgTransportError::Recv)?;
 
                 let _keepalive = &buf[..len];
+            } else {
+                error!("Timeout from read recieved");
+                return Err(WgTransportError::Timeout);
             }
+        } else {
+            error!("Timeout from read recieved");
+            return Err(WgTransportError::Timeout);
         }
 
         self.handshake = HandshakeState::Done;
@@ -228,22 +279,37 @@ impl WgSocket {
     // Write to the Wireguard peer by using to underlying Tunn structure to
     // encrypt/encapsulate the data and the UDP socket to send it to the peer endpoint.
     // Fails if the Tunn has not performed the necessary Wireguard handshake.
-    pub async fn write(&mut self, data: &[u8]) -> Result<usize> {
+    pub async fn write(&mut self, data: &[u8]) -> Result<usize, WgTransportError> {
         if self.handshake != HandshakeState::Done {
             error!("Write failed: no handshake");
-            return Err(WgSocketError::NoHandshake.into());
+            return Err(WgTransportError::NoHandshake);
         }
 
         let mut dst = vec![0u8; 2048];
-        let enc_data =
-            if let TunnResult::WriteToNetwork(data) = self.tunn.encapsulate(data, &mut dst) {
-                data
-            } else {
-                unreachable!();
-            };
+        let enc_data = match self.tunn.encapsulate(data, &mut dst) {
+            TunnResult::WriteToNetwork(data) => data,
+            TunnResult::Err(e) => {
+                error!("Wireguard Tunn error");
+                return Err(WgTransportError::WgError(e));
+            }
+            _ => {
+                error!("Unexpected Wireguard packet");
+                return Err(WgTransportError::UnexpectedPacket);
+            }
+        };
 
-        let socket = self.socket.as_ref().unwrap();
-        let len = socket.send(enc_data).await.expect("UDP socket send failed");
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Handshake initiation failed: no binded socket");
+                return Err(WgTransportError::NotBinded);
+            }
+        };
+
+        let len = socket
+            .send(enc_data)
+            .await
+            .map_err(WgTransportError::Send)?;
 
         Ok(len)
     }
@@ -251,24 +317,33 @@ impl WgSocket {
     // Read from the Wireguard peer by using to underlying Tunn structure to
     // decryp/decapsulate the data received from the UDP socket connection.
     // Fails if the Tunn has not performed the necessary Wireguard handshake.
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, WgTransportError> {
         if self.handshake != HandshakeState::Done {
             error!("Write failed: no handshake");
-            return Err(WgSocketError::NoHandshake.into());
+            return Err(WgTransportError::NoHandshake);
         }
 
-        let socket = self.socket.as_ref().unwrap();
-        let len = socket
-            .recv(buf)
-            .await
-            .expect("UDP socket recv calle failed");
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Handshake initiation failed: no binded socket");
+                return Err(WgTransportError::NotBinded);
+            }
+        };
+
+        let len = socket.recv(buf).await.map_err(WgTransportError::Recv)?;
+
         let mut dst = vec![0u8; 2048];
-        let data = if let TunnResult::WriteToTunnelV4(data, _src) =
-            self.tunn.decapsulate(None, &buf[..len], &mut dst)
-        {
-            data
-        } else {
-            unreachable!();
+        let data = match self.tunn.decapsulate(None, &buf[..len], &mut dst) {
+            TunnResult::WriteToTunnelV4(data, _src) => data,
+            TunnResult::Err(e) => {
+                error!("Wireguard Tunn error");
+                return Err(WgTransportError::WgError(e));
+            }
+            _ => {
+                error!("Unexpected Wireguard packet");
+                return Err(WgTransportError::UnexpectedPacket);
+            }
         };
 
         let out_len = data.len();
@@ -328,11 +403,11 @@ impl WgListener {
 
     // Binds the underlying UDP socket and makes is usable for future use,
     // as well as updating the socket value to Some
-    pub async fn bind(&mut self) -> Result<()> {
+    pub async fn bind(&mut self) -> Result<(), WgTransportError> {
         if self.socket.is_none() {
             let socket = UdpSocket::bind(self.socketaddr)
                 .await
-                .expect("failed to bind UDP socket");
+                .map_err(WgTransportError::Bind)?;
 
             self.socket = Some(socket);
             info!("UDP socket binded to {}", self.socketaddr);
@@ -351,42 +426,55 @@ impl WgListener {
         &mut self,
         handshake_init: &[u8],
         endpoint: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<(), WgTransportError> {
         if handshake_init.len() != 148 {
-            return Err(anyhow!("Invalid handshake init size"));
+            return Err(WgTransportError::InvalidSize(handshake_init.len(), 148));
         }
 
-        if self.socket.is_none() {
-            error!("Handshake initiation failed: no binded socket");
-            return Err(WgSocketError::NotBinded.into());
-        }
-        let socket = self.socket.as_ref().unwrap();
-
-        let handshake_init_p = if let Packet::HandshakeInit(p) =
-            Tunn::parse_incoming_packet(handshake_init).unwrap()
-        {
-            p
-        } else {
-            return Err(anyhow!("unexpected wireguard packet type"));
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Handshake initiation failed: no binded socket");
+                return Err(WgTransportError::NotBinded);
+            }
         };
-        let halfhandshake = boringtun::noise::handshake::parse_handshake_anon(
+
+        let handshake_init_p = match Tunn::parse_incoming_packet(handshake_init).unwrap() {
+            Packet::HandshakeInit(p) => p,
+            _ => {
+                error!("Unexpect Wireguard packet");
+                return Err(WgTransportError::UnexpectedPacket);
+            }
+        };
+
+        let halfhandshake = match boringtun::noise::handshake::parse_handshake_anon(
             &self.static_secret,
             &self.static_pub,
             &handshake_init_p,
-        )
-        .unwrap();
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                error!("Unexpect Wireguard packet");
+                return Err(WgTransportError::UnexpectedPacket);
+            }
+        };
 
         let peer_static_public = x25519::PublicKey::from(halfhandshake.peer_static_public);
 
-        let mut tunn = Tunn::new(
+        let mut tunn = match Tunn::new(
             self.static_secret.clone(),
             peer_static_public,
             None,
             None,
             self.index,
             None,
-        )
-        .expect("failed to create Tunn structure for new peer");
+        ) {
+            Ok(tunn) => tunn,
+            Err(_) => {
+                error!("Unexpect Wireguard packet");
+                return Err(WgTransportError::CreateTunnFailed);
+            }
+        };
 
         let mut dst = vec![0u8; 2048];
         match tunn.decapsulate(None, handshake_init, &mut dst) {
@@ -394,14 +482,13 @@ impl WgListener {
                 socket
                     .send_to(data, endpoint)
                     .await
-                    .expect("UDP socket send_to call failed");
+                    .map_err(WgTransportError::Send)?;
             }
             TunnResult::Err(e) => {
-                println!("{e:?}");
-                return Err(anyhow!("{e:?}"));
+                return Err(WgTransportError::WgError(e));
             }
             _ => {
-                return Err(anyhow!("unexpted tunn result"));
+                return Err(WgTransportError::UnexpectedPacket);
             }
         }
         //// Recieve and parse keepalive
@@ -429,46 +516,50 @@ impl WgListener {
     // is recieved it checks if the peer is known. If it is known we perform
     // the decryption/decapsulation using the peer's respective Tunn structure.
     // If it is not known, the Wireguard handshake is performed.
-    pub async fn incoming(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.socket.is_none() {
-            error!("Accept failed: no binded socket");
-            return Err(WgSocketError::NotBinded.into());
-        }
-        let socket = self.socket.as_ref().unwrap();
+    pub async fn incoming(&mut self) -> Result<Option<Vec<u8>>, WgTransportError> {
+        let socket = match self.socket.as_ref() {
+            Some(socket) => socket,
+            None => {
+                error!("Listener socket not binded");
+                return Err(WgTransportError::NotBinded);
+            }
+        };
 
         let mut buf = vec![0u8; 2048];
-        match socket.recv_from(&mut buf).await {
-            Ok((len, peer)) => {
-                if self.peers.contains_key(&peer) {
-                    let (_pub_key, tunn) = self.peers.get_mut(&peer).unwrap();
+        let (len, peer) = socket
+            .recv_from(&mut buf)
+            .await
+            .map_err(WgTransportError::Recv)?;
 
-                    let mut dst = vec![0u8; 2048];
-                    match tunn.decapsulate(None, &buf[..len], &mut dst) {
-                        TunnResult::Done => {
-                            return Ok(None);
-                        }
-                        TunnResult::WriteToNetwork(data) => {
-                            return Ok(Some(data.into()));
-                        }
-                        TunnResult::Err(e) => {
-                            return Err(anyhow!("{e:?}"));
-                        }
-                        TunnResult::WriteToTunnelV4(data, _src) => {
-                            return Ok(Some(data.into()));
-                        }
-                        _ => {
-                            return Err(anyhow!("Unexpted message"));
-                        }
-                    }
+        if self.peers.contains_key(&peer) {
+            let (_pub_key, tunn) = self.peers.get_mut(&peer).unwrap();
+
+            let mut dst = vec![0u8; 2048];
+            match tunn.decapsulate(None, &buf[..len], &mut dst) {
+                TunnResult::Done => {
+                    return Ok(None);
                 }
-
-                let handshake_init = &buf[..len];
-                self.handle_handshake_init(handshake_init, peer).await?;
-
-                Ok(None)
+                TunnResult::WriteToNetwork(data) => {
+                    return Ok(Some(data.into()));
+                }
+                TunnResult::Err(e) => {
+                    error!("Wireguard error: {e:?}");
+                    return Err(WgTransportError::WgError(e));
+                }
+                TunnResult::WriteToTunnelV4(data, _src) => {
+                    return Ok(Some(data.into()));
+                }
+                _ => {
+                    error!("Unexpect Wireguard packet");
+                    return Err(WgTransportError::UnexpectedPacket);
+                }
             }
-            Err(e) => Err(e.into()),
         }
+
+        let handshake_init = &buf[..len];
+        self.handle_handshake_init(handshake_init, peer).await?;
+
+        Ok(None)
     }
 }
 
@@ -542,6 +633,10 @@ mod tests {
 
     #[tokio::test]
     async fn listener_test() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::max())
+            .is_test(true)
+            .try_init();
         let listener_priv = x25519::StaticSecret::random_from_rng(OsRng);
         let listener_pub = x25519::PublicKey::from(&listener_priv);
         let listener_idx = OsRng.next_u32();
