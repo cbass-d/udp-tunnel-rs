@@ -1,9 +1,8 @@
+use libp2p::{Multiaddr, PeerId};
 use std::{io, net::SocketAddr};
 
-use libp2p::{Multiaddr, PeerId};
-
-pub mod behaviour;
 pub mod config;
+pub mod key;
 pub mod mesh;
 pub mod message;
 pub mod peer;
@@ -42,8 +41,12 @@ pub enum WgMeshError {
     SwarmBuild(String),
     #[error("At least one peer node needed")]
     NoPeerNodes,
+    #[error("No private key set")]
+    NoPrivateKey,
     #[error("Failed to subscribe: {0}")]
     FailedSubTopic(String),
+    #[error("Failed to send init message: {0}")]
+    FailedInitMessage(String),
     #[error("Gossipsub init: {0}")]
     GossipsubInit(String),
     #[error("{0}")]
@@ -55,42 +58,3 @@ pub enum WgMeshError {
     //#[error("Identify protocol init: {0}")]
     //IdentifyInit(String),
 }
-
-//pub async fn run_node(
-//    config: Arc<Config>,
-//    keypair: Keypair,
-//    cancel_token: CancellationToken,
-//) -> Result<(), WgMeshError> {
-//    // Non-bootstrap nodes need at least one peer node
-//    // in order to join the network
-//    if !config.bootstrap && config.known_peers.is_none() {
-//        return Err(WgMeshError::NoPeerNodes.into());
-//    }
-//
-//    let known_peers = if let Some(known_peers) = &config.known_peers {
-//        let peers = read_peer_list(known_peers);
-//        info!("Known peers: {:?}", peers);
-//        Some(peers)
-//    } else {
-//        None
-//    };
-//
-//    //let (mut node, mut swarm) = Node::build(&config)?;
-//    //node.add_known(&mut swarm, known_peers);
-//
-//    //{
-//    //    let token = cancel_token.clone();
-//    //    tokio::spawn(async move { node.run(swarm, &config.clone(), token).await });
-//    //    debug!("listen task started");
-//    //}
-//
-//    loop {
-//        tokio::select! {
-//            _ = cancel_token.cancelled() => {
-//                 break;
-//             },
-//        }
-//    }
-//
-//    Ok(())
-//}

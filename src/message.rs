@@ -12,12 +12,22 @@ pub enum WgMeshMessage {
         info: Info,
         seq_no: Option<u64>,
     },
+    Request {
+        propagation_source: PeerId,
+        from: Option<PeerId>,
+        info: Info,
+        seq_no: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Info {
     pub is_bootstrap: Option<bool>,
+    pub is_exit: Option<bool>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Request {}
 
 impl TryFrom<Event> for WgMeshMessage {
     type Error = anyhow::Error;

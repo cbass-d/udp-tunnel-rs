@@ -1,20 +1,17 @@
-use rand_core::RngCore;
-use std::{ffi::OsString, fs};
-
 use anyhow::Result;
-use clap::Parser;
-use libp2p::Multiaddr;
-use libp2p_identity::Keypair;
+use clap::{Arg, ArgAction, command};
 use log::{LevelFilter, debug, info};
-use rand_core::OsRng;
 use tokio::{signal::ctrl_c, task::JoinSet};
 use tunnel::{
-    WgMeshError,
-    config::{CliArgs, Config},
-    peer::Peer,
+    WgMeshError, config, key,
+    peer::{Peer, builder::PeerBuilder},
+    wg::WireguardInterface,
 };
 
-const KEY_LEN: usize = 68;
+enum KeyType {
+    P2P,
+    WG,
+}
 
 pub fn init_log() {
     env_logger::builder()
@@ -24,99 +21,63 @@ pub fn init_log() {
         .init();
 }
 
-// Read in keyfile (ed25519 previously encoded by Keypair::protobuf_encoding)
-fn read_key_flie(file: &OsString) -> Result<Keypair, WgMeshError> {
-    debug!("reading key file from: {:?}", file);
-    let key_bytes = fs::read(file).map_err(WgMeshError::Io)?;
-    let key_bytes = key_bytes.trim_ascii();
-
-    let len = key_bytes.len();
-    match len {
-        KEY_LEN => {
-            let keypair = Keypair::from_protobuf_encoding(&key_bytes)
-                .map_err(|e| WgMeshError::InvalidKeyFile(e.to_string()))?;
-
-            debug!("successully read ed25519 key file");
-
-            Ok(keypair)
-        }
-        _ => Err(WgMeshError::InvalidKeyFile(format!(
-            "invalid key len: {len}, expected {KEY_LEN}"
-        ))),
-    }
-}
-
-//fn read_peer_list(file: &OsString) -> Vec<Multiaddr> {
-//    let peers: KnownPeers = confy::load_path(file).unwrap();
-//
-//    peers.peers
-//}
-
 #[tokio::main]
 pub async fn main() -> Result<(), WgMeshError> {
     init_log();
 
-    let cli_args = CliArgs::parse();
-
-    let mut config: Config = if let Some(conf_file) = &cli_args.conf_file {
-        confy::load_path(conf_file).map_err(|e| WgMeshError::FailedToLoadConf(e.to_string()))?
-    } else {
-        confy::load("wg-mesh", Some("wg-mesh-conf"))
-            .map_err(|e| WgMeshError::FailedToLoadConf(e.to_string()))?
-    };
-
-    println!("{:?}", config);
-
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-
-    // We either read in the private ed25519 from the given file
-    // or we generate a new one and write it to a file
-    let keypair = if let Some(key_file) = config.priv_key.clone() {
-        debug!("using key file from CLI");
-        read_key_flie(&key_file.into())?
-    } else {
-        debug!("generating random ed25519 key to use");
-        let keypair = Keypair::generate_ed25519();
-        let keyfile = format!("peer_{}.key", OsRng.next_u32());
-        fs::write(
-            keyfile.clone(),
-            &keypair
-                .to_protobuf_encoding()
-                .map_err(|e| WgMeshError::DecodeError(e.to_string()))?,
+    // Declare the CLI arguments to be read in, if any
+    let matches = command!()
+        .arg(
+            Arg::new("gen-keys")
+                .short('g')
+                .long("gen-keys")
+                .action(ArgAction::SetTrue),
         )
-        .map_err(WgMeshError::Io)?;
+        .arg(Arg::new("conf-file").short('c').long("conf-file"))
+        .get_matches();
 
-        info!("generated ed25519 key written to \"{}\"", keyfile);
-
-        config.priv_key = Some(keyfile);
-
-        keypair
-    };
-
-    // Store the updated conf file
-    if let Some(conf_file) = &cli_args.conf_file {
-        confy::store_path(conf_file, &config)
-            .map_err(|e| WgMeshError::FailedToStoreConf(e.to_string()))?;
-    } else {
-        confy::store("wg-mesh", "wg-mesh-conf", &config)
-            .map_err(|e| WgMeshError::FailedToStoreConf(e.to_string()))?;
+    // If the 'gen-keys' flag is present we generate the keys and exit the program
+    if matches.get_flag("gen-keys") {
+        key::gen_keys()?;
+        return Ok(());
     }
 
-    let mut tasks = JoinSet::new();
+    // Load the application config to be used
+    let mut config = config::load_config(matches.get_one::<String>("conf-file"))?;
 
-    let mut peer = Peer::build(&config, keypair)?;
+    // We either read in the private ed25519 for libp2p from the given file
+    // or we generate a new one and write it to a file
+    let (p2p_key, p2p_key_file) = key::load_or_generate_ed25519(config.p2p_priv_key.as_ref())?;
 
+    // Repeat the same process for Wireguard x25519 secret
+    let (wg_key, wg_key_file) = key::load_or_generate_x25519(config.wg_priv_key.as_ref())?;
+
+    // Update the file key paths to store in config
+    config.update_keys(Some(p2p_key_file), Some(wg_key_file));
+
+    // Store the updated conf file
+    config::store_config(&config, matches.get_one::<String>("conf-file"))?;
+
+    // If the peer is not a bootstrap and does not have the knowledge
+    // of other peers to connect to, it cannot join the network
     if !config.is_bootstrap && config.known_peers.is_empty() {
         return Err(WgMeshError::NoPeerNodes);
     }
 
-    // Read list of alredy known peers, if any
-    // Passed as a file through the CLI
-    let known_peers = config.known_peers.clone();
+    let mut peer_builder = PeerBuilder::new();
+    peer_builder.set_priv_key(p2p_key);
+    peer_builder.bootstrap(config.is_bootstrap);
+    peer_builder.exit(config.is_exit);
+    peer_builder.known_peers(config.known_peers.clone());
+
+    let mut peer = peer_builder.build()?;
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let mut tasks = JoinSet::new();
 
     {
         let token = cancel_token.clone();
-        tasks.spawn(async move { peer.run(&config, known_peers, token).await });
+        tasks.spawn(async move { peer.run(&config, token).await });
     }
 
     // When ctrl + c is hit, signal to stop all tasks
